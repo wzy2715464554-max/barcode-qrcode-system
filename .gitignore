@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.python-version
+
+outputs/
+*.log
+
+# Temporary Word lock files
+*.docx
+~$*.docx
+
+# Personal test photos are useful locally but may contain private surroundings.
+data/IMG_*.jpg
+data/IMG_*.jpeg
+data/IMG_*.png

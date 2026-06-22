@@ -1,0 +1,313 @@
+import argparse
+import datetime as dt
+from pathlib import Path
+from urllib.parse import urlparse
+import webbrowser
+
+import cv2
+import numpy as np
+
+try:
+    import zxingcpp
+except ImportError as exc:
+    raise SystemExit(
+        "缺少 zxing-cpp，请先运行：R:\\anaconda\\envs\\barcode_env\\python.exe -m pip install zxing-cpp"
+    ) from exc
+
+
+ROOT = Path(__file__).resolve().parent
+DATA_DIR = ROOT / "data"
+OUTPUT_DIR = ROOT / "outputs"
+OPENED_URLS = set()
+
+
+def normalize_url(text):
+    value = (text or "").strip()
+    if value.startswith(("http://", "https://")):
+        parsed = urlparse(value)
+        if parsed.netloc:
+            return value
+    if value.lower().startswith("www."):
+        return "https://" + value
+    return None
+
+
+def open_urls(decoded):
+    for item in decoded:
+        url = normalize_url(item.text)
+        if url and url not in OPENED_URLS:
+            OPENED_URLS.add(url)
+            print(f"检测到网址，正在打开：{url}")
+            webbrowser.open(url)
+
+
+def preprocess(frame):
+    """Return an enhanced binary image used by the classical localization demo."""
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    grad_x = cv2.Sobel(blur, cv2.CV_32F, 1, 0, ksize=-1)
+    grad_y = cv2.Sobel(blur, cv2.CV_32F, 0, 1, ksize=-1)
+    gradient = cv2.convertScaleAbs(cv2.subtract(grad_x, grad_y))
+    _, binary = cv2.threshold(gradient, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (21, 7))
+    closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+    closed = cv2.erode(closed, None, iterations=2)
+    closed = cv2.dilate(closed, None, iterations=2)
+    return closed
+
+
+def locate_barcode_candidates(frame):
+    """Locate likely 1D barcode regions with gradients and contour filtering."""
+    mask = preprocess(frame)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    boxes = []
+
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if area < 1200:
+            continue
+        rect = cv2.minAreaRect(contour)
+        width, height = rect[1]
+        if width <= 0 or height <= 0:
+            continue
+        long_side = max(width, height)
+        short_side = min(width, height)
+        ratio = long_side / short_side
+        if ratio < 1.6:
+            continue
+        box = cv2.boxPoints(rect).astype(int)
+        boxes.append(box)
+
+    return boxes
+
+
+def locate_qr_finder_patterns(frame):
+    """Find QR finder-pattern candidates by contour nesting like 回-shaped marks."""
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    binary = cv2.adaptiveThreshold(
+        blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 5
+    )
+    contours, hierarchy = cv2.findContours(binary, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    if hierarchy is None:
+        return []
+
+    hierarchy = hierarchy[0]
+    boxes = []
+    used_centers = []
+
+    for index, contour in enumerate(contours):
+        area = cv2.contourArea(contour)
+        if area < 80:
+            continue
+
+        child = hierarchy[index][2]
+        if child == -1:
+            continue
+        grandchild = hierarchy[child][2]
+        if grandchild == -1:
+            continue
+
+        x, y, w, h = cv2.boundingRect(contour)
+        ratio = w / float(h)
+        if not 0.65 <= ratio <= 1.35:
+            continue
+
+        center = (x + w // 2, y + h // 2)
+        if any(abs(center[0] - px) < 10 and abs(center[1] - py) < 10 for px, py in used_centers):
+            continue
+
+        used_centers.append(center)
+        boxes.append(np.array([[x, y], [x + w, y], [x + w, y + h], [x, y + h]], dtype=np.int32))
+
+    return boxes
+
+
+def decode_barcodes(frame):
+    """Decode QR codes and common barcodes with ZXing-C++."""
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    return zxingcpp.read_barcodes(rgb)
+
+
+def barcode_points(barcode):
+    pos = barcode.position
+    points = [
+        (int(pos.top_left.x), int(pos.top_left.y)),
+        (int(pos.top_right.x), int(pos.top_right.y)),
+        (int(pos.bottom_right.x), int(pos.bottom_right.y)),
+        (int(pos.bottom_left.x), int(pos.bottom_left.y)),
+    ]
+    return np.array(points, dtype=np.int32)
+
+
+def draw_results(frame, decoded, candidates=None, qr_patterns=None):
+    result = frame.copy()
+
+    for box in candidates or []:
+        cv2.polylines(result, [box], True, (255, 180, 0), 2)
+
+    for box in qr_patterns or []:
+        cv2.polylines(result, [box], True, (255, 80, 80), 2)
+
+    for item in decoded:
+        points = barcode_points(item)
+        cv2.polylines(result, [points], True, (0, 255, 0), 3)
+        text = item.text if item.text else "<empty>"
+        label = f"{item.format}: {text}"
+        x, y = points[0]
+        y = max(25, y - 10)
+        cv2.putText(result, label[:80], (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+    return result
+
+
+def order_points(points):
+    rect = np.zeros((4, 2), dtype="float32")
+    pts = points.astype("float32")
+    s = pts.sum(axis=1)
+    diff = np.diff(pts, axis=1)
+    rect[0] = pts[np.argmin(s)]
+    rect[2] = pts[np.argmax(s)]
+    rect[1] = pts[np.argmin(diff)]
+    rect[3] = pts[np.argmax(diff)]
+    return rect
+
+
+def perspective_correct(frame, points):
+    rect = order_points(points)
+    tl, tr, br, bl = rect
+    width_a = np.linalg.norm(br - bl)
+    width_b = np.linalg.norm(tr - tl)
+    height_a = np.linalg.norm(tr - br)
+    height_b = np.linalg.norm(tl - bl)
+    max_width = max(1, int(max(width_a, width_b)))
+    max_height = max(1, int(max(height_a, height_b)))
+
+    dst = np.array(
+        [[0, 0], [max_width - 1, 0], [max_width - 1, max_height - 1], [0, max_height - 1]],
+        dtype="float32",
+    )
+    matrix = cv2.getPerspectiveTransform(rect, dst)
+    return cv2.warpPerspective(frame, matrix, (max_width, max_height))
+
+
+def save_rectified_regions(frame, decoded, prefix):
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    saved = []
+    stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    for index, item in enumerate(decoded, 1):
+        points = barcode_points(item)
+        corrected = perspective_correct(frame, points)
+        path = OUTPUT_DIR / f"{prefix}_rectified_{index}_{stamp}.jpg"
+        cv2.imwrite(str(path), corrected)
+        saved.append(path)
+    return saved
+
+
+def save_result(image, prefix):
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = OUTPUT_DIR / f"{prefix}_{stamp}.jpg"
+    cv2.imwrite(str(path), image)
+    print(f"结果已保存：{path}")
+
+
+def run_image(path, show_window=True):
+    frame = cv2.imread(str(path))
+    if frame is None:
+        raise SystemExit(f"无法读取图片：{path}")
+
+    decoded = decode_barcodes(frame)
+    open_urls(decoded)
+    candidates = locate_barcode_candidates(frame)
+    qr_patterns = locate_qr_finder_patterns(frame)
+    result = draw_results(frame, decoded, candidates, qr_patterns)
+
+    print(f"检测到 {len(decoded)} 个可解码条码/二维码")
+    for i, item in enumerate(decoded, 1):
+        print(f"{i}. 类型：{item.format}，内容：{item.text}")
+
+    save_result(result, "image_result")
+    rectified = save_rectified_regions(frame, decoded, "image_result")
+    for path in rectified:
+        print(f"校正区域已保存：{path}")
+    if show_window:
+        cv2.imshow("barcode/qrcode result", result)
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
+
+
+def run_camera(camera_id):
+    cap = cv2.VideoCapture(camera_id)
+    if not cap.isOpened():
+        raise SystemExit(f"无法打开摄像头：{camera_id}")
+
+    print("摄像头已启动：按 q 退出，按 s 保存当前识别结果。")
+    last_result = None
+
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            print("读取摄像头画面失败。")
+            break
+
+        decoded = decode_barcodes(frame)
+        open_urls(decoded)
+        candidates = locate_barcode_candidates(frame)
+        qr_patterns = locate_qr_finder_patterns(frame)
+        result = draw_results(frame, decoded, candidates, qr_patterns)
+        last_result = result
+
+        cv2.putText(result, "q: quit  s: save", (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (40, 220, 255), 2)
+        cv2.imshow("real-time barcode/qrcode detection", result)
+
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord("q"):
+            break
+        if key == ord("s") and last_result is not None:
+            save_result(last_result, "camera_result")
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+
+def make_samples():
+    DATA_DIR.mkdir(exist_ok=True)
+
+    import qrcode
+    from barcode import Code128
+    from barcode.writer import ImageWriter
+
+    qr = qrcode.make("https://www.njit.edu.cn/")
+    qr_path = DATA_DIR / "sample_qrcode.png"
+    qr.save(qr_path)
+
+    barcode_path = DATA_DIR / "sample_code128"
+    Code128("NJIT2026BARCODE", writer=ImageWriter()).save(str(barcode_path))
+
+    print(f"已生成二维码：{qr_path}")
+    print(f"已生成条形码：{barcode_path}.png")
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="条形码与二维码实时定位与解码系统")
+    parser.add_argument("image", nargs="?", help="待检测图片路径；不填则打开摄像头")
+    parser.add_argument("--camera", type=int, default=0, help="摄像头编号，默认 0")
+    parser.add_argument("--make-samples", action="store_true", help="生成二维码和条形码测试图片")
+    parser.add_argument("--no-window", action="store_true", help="只保存结果，不弹出显示窗口")
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    if args.make_samples:
+        make_samples()
+        return
+    if args.image:
+        run_image(Path(args.image), show_window=not args.no_window)
+        return
+    run_camera(args.camera)
+
+
+if __name__ == "__main__":
+    main()
