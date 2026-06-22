@@ -1,0 +1,18 @@
+Source: BoofCV QR Code benchmark dataset
+Dataset URL: https://boofcv.org/notwiki/regression/fiducial/qrcodes_v3.zip
+Reference page: https://boofcv.org/index.php?title=Performance:QrCode
+
+Selected categories:
+- blurred: motion/defocus blur
+- brightness: low/high brightness variation
+- bright_spots: local bright spots
+- damaged: damaged or partially degraded QR codes
+- glare: reflective glare
+- perspective: tilted perspective deformation
+- rotations: rotated QR codes
+- shadows: shadow interference
+- curved: curved surface QR codes
+- lots: multiple QR codes in one image
+- nominal: normal reference cases
+
+These images are used as complex-scene test samples for the course design.

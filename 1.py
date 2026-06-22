@@ -1,4 +1,5 @@
 import argparse
+import csv
 import datetime as dt
 from pathlib import Path
 from urllib.parse import urlparse
@@ -19,6 +20,8 @@ ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "data"
 OUTPUT_DIR = ROOT / "outputs"
 OPENED_URLS = set()
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+TEXT_PREVIEW_LIMIT = 220
 
 
 class DecodedItem:
@@ -46,6 +49,13 @@ def open_urls(decoded):
             OPENED_URLS.add(url)
             print(f"检测到网址，正在打开：{url}")
             webbrowser.open(url)
+
+
+def preview_text(text, limit=TEXT_PREVIEW_LIMIT):
+    value = (text or "").strip()
+    if len(value) <= limit:
+        return value
+    return value[:limit] + "..."
 
 
 def preprocess(frame):
@@ -266,6 +276,130 @@ def save_result(image, prefix):
     path = OUTPUT_DIR / f"{prefix}_{stamp}.jpg"
     cv2.imwrite(str(path), image)
     print(f"结果已保存：{path}")
+    return path
+
+
+def save_decoded_text(decoded, prefix):
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = OUTPUT_DIR / f"{prefix}_decoded_{stamp}.txt"
+    with path.open("w", encoding="utf-8") as file:
+        if not decoded:
+            file.write("未检测到可解码的条形码或二维码。\n")
+        for index, item in enumerate(decoded, 1):
+            file.write(f"{index}. 类型：{item.format}\n")
+            file.write(f"   内容：{item.text}\n\n")
+    return path
+
+
+def save_preprocess_images(frame, prefix):
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    mask = preprocess(frame)
+    paths = []
+    outputs = {
+        "gray": gray,
+        "blur": blur,
+        "binary_morph": mask,
+    }
+    for name, image in outputs.items():
+        path = OUTPUT_DIR / f"{prefix}_{name}_{stamp}.jpg"
+        cv2.imwrite(str(path), image)
+        paths.append(path)
+    return paths
+
+
+def analyze_frame(frame):
+    candidates = locate_barcode_candidates(frame)
+    decoded = decode_barcodes(frame, candidates)
+    qr_patterns = locate_qr_finder_patterns(frame)
+    result = draw_results(frame, decoded, candidates, qr_patterns)
+    return {
+        "decoded": decoded,
+        "candidates": candidates,
+        "qr_patterns": qr_patterns,
+        "result": result,
+    }
+
+
+def image_files(folder):
+    root = Path(folder)
+    return sorted(
+        path for path in root.rglob("*")
+        if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+    )
+
+
+def category_from_path(path):
+    name = Path(path).stem
+    parts = name.split("_")
+    if len(parts) >= 3 and parts[0] == "qr":
+        return parts[1]
+    return Path(path).parent.name
+
+
+def batch_test_folder(folder, save_visuals=True):
+    files = image_files(folder)
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    csv_path = OUTPUT_DIR / f"batch_report_{stamp}.csv"
+    visual_dir = OUTPUT_DIR / f"batch_visuals_{stamp}"
+    if save_visuals:
+        visual_dir.mkdir(exist_ok=True)
+
+    rows = []
+    success_count = 0
+    for path in files:
+        frame = cv2.imread(str(path))
+        if frame is None:
+            rows.append({
+                "file": str(path),
+                "category": category_from_path(path),
+                "success": "否",
+                "count": 0,
+                "formats": "",
+                "contents": "无法读取图片",
+            })
+            continue
+
+        analysis = analyze_frame(frame)
+        decoded = analysis["decoded"]
+        success = bool(decoded)
+        success_count += int(success)
+
+        if save_visuals:
+            result_path = visual_dir / f"{path.stem}_result.jpg"
+            cv2.imwrite(str(result_path), analysis["result"])
+
+        rows.append({
+            "file": str(path),
+            "category": category_from_path(path),
+            "success": "是" if success else "否",
+            "count": len(decoded),
+            "formats": " | ".join(str(item.format) for item in decoded),
+            "contents": " | ".join(preview_text(item.text, 120) for item in decoded),
+        })
+
+    with csv_path.open("w", newline="", encoding="utf-8-sig") as file:
+        writer = csv.DictWriter(
+            file,
+            fieldnames=["file", "category", "success", "count", "formats", "contents"],
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+
+    total = len(files)
+    rate = (success_count / total * 100) if total else 0.0
+    return {
+        "csv_path": csv_path,
+        "visual_dir": visual_dir if save_visuals else None,
+        "rows": rows,
+        "total": total,
+        "success": success_count,
+        "rate": rate,
+    }
 
 
 def run_image(path, show_window=True):
@@ -273,17 +407,18 @@ def run_image(path, show_window=True):
     if frame is None:
         raise SystemExit(f"无法读取图片：{path}")
 
-    candidates = locate_barcode_candidates(frame)
-    decoded = decode_barcodes(frame, candidates)
+    analysis = analyze_frame(frame)
+    decoded = analysis["decoded"]
     open_urls(decoded)
-    qr_patterns = locate_qr_finder_patterns(frame)
-    result = draw_results(frame, decoded, candidates, qr_patterns)
+    result = analysis["result"]
 
     print(f"检测到 {len(decoded)} 个可解码条码/二维码")
     for i, item in enumerate(decoded, 1):
-        print(f"{i}. 类型：{item.format}，内容：{item.text}")
+        print(f"{i}. 类型：{item.format}，内容：{preview_text(item.text)}")
 
     save_result(result, "image_result")
+    text_path = save_decoded_text(decoded, "image_result")
+    print(f"完整识别文本已保存：{text_path}")
     rectified = save_rectified_regions(frame, decoded, "image_result")
     for path in rectified:
         print(f"校正区域已保存：{path}")
@@ -307,11 +442,10 @@ def run_camera(camera_id):
             print("读取摄像头画面失败。")
             break
 
-        candidates = locate_barcode_candidates(frame)
-        decoded = decode_barcodes(frame, candidates)
+        analysis = analyze_frame(frame)
+        decoded = analysis["decoded"]
         open_urls(decoded)
-        qr_patterns = locate_qr_finder_patterns(frame)
-        result = draw_results(frame, decoded, candidates, qr_patterns)
+        result = analysis["result"]
         last_result = result
 
         cv2.putText(result, "q: quit  s: save", (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (40, 220, 255), 2)
@@ -379,6 +513,8 @@ def parse_args():
     parser.add_argument("--make-samples", action="store_true", help="生成二维码和条形码测试图片")
     parser.add_argument("--make-qr", help="根据输入文字或网址生成二维码")
     parser.add_argument("--qr-output", help="二维码输出文件名，默认保存到 data/ 文件夹")
+    parser.add_argument("--batch", help="批量识别指定文件夹，并生成 CSV 测试报告")
+    parser.add_argument("--no-visuals", action="store_true", help="批量测试时不保存可视化结果图")
     parser.add_argument("--no-window", action="store_true", help="只保存结果，不弹出显示窗口")
     return parser.parse_args()
 
@@ -390,6 +526,13 @@ def main():
         return
     if args.make_qr:
         make_qr_code(args.make_qr, args.qr_output)
+        return
+    if args.batch:
+        report = batch_test_folder(args.batch, save_visuals=not args.no_visuals)
+        print(f"批量测试完成：{report['success']}/{report['total']}，成功率 {report['rate']:.2f}%")
+        print(f"CSV 报告：{report['csv_path']}")
+        if report["visual_dir"]:
+            print(f"可视化结果：{report['visual_dir']}")
         return
     if args.image:
         run_image(Path(args.image), show_window=not args.no_window)
