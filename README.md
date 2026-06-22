@@ -50,6 +50,12 @@ python gui.py
 python 1.py --make-samples
 ```
 
+把图片地址或网页地址生成二维码：
+
+```bash
+python 1.py --make-qr "https://example.com/test.jpg" --qr-output image_url_qrcode.png
+```
+
 识别单张图片：
 
 ```bash
@@ -82,4 +88,3 @@ data/             测试图片
 outputs/          程序输出结果，默认不上传 GitHub
 requirements.txt  Python 依赖
 ```
-

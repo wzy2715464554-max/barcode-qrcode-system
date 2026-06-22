@@ -1,7 +1,7 @@
 import importlib.util
 from pathlib import Path
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, simpledialog
 from urllib.parse import urlparse
 import webbrowser
 
@@ -72,6 +72,9 @@ class BarcodeApp:
         self.save_btn = tk.Button(toolbar, text="保存当前结果", command=self.save_current, width=14, state=tk.DISABLED)
         self.save_btn.pack(side=tk.LEFT, padx=6)
 
+        self.make_qr_btn = tk.Button(toolbar, text="生成网址二维码", command=self.create_url_qrcode, width=16)
+        self.make_qr_btn.pack(side=tk.LEFT, padx=6)
+
         main = tk.Frame(self.root, bg="#f4f6f8")
         main.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=18, pady=(0, 18))
 
@@ -121,9 +124,9 @@ class BarcodeApp:
         self.image_panel.config(image=self.current_photo, text="")
 
     def process_frame(self, frame, open_mode="camera"):
-        decoded = core.decode_barcodes(frame)
-        self.open_urls(decoded, mode=open_mode)
         candidates = core.locate_barcode_candidates(frame)
+        decoded = core.decode_barcodes(frame, candidates)
+        self.open_urls(decoded, mode=open_mode)
         qr_patterns = core.locate_qr_finder_patterns(frame)
         result = core.draw_results(frame, decoded, candidates, qr_patterns)
         self.current_frame = frame.copy()
@@ -219,6 +222,31 @@ class BarcodeApp:
         result, decoded = self.process_frame(frame, open_mode="image")
         self.show_frame(result)
         self.set_status(f"图片识别完成，检测到 {len(decoded)} 个")
+
+    def create_url_qrcode(self):
+        url = simpledialog.askstring("生成网址二维码", "请输入图片地址或网页地址：", parent=self.root)
+        if not url:
+            return
+
+        url = url.strip()
+        normalized = self.normalize_url(url)
+        if normalized:
+            url = normalized
+
+        path = core.make_qr_code(url)
+        image = cv2.imread(str(path))
+        if image is not None:
+            self.current_result = image
+            self.current_frame = image.copy()
+            self.current_decoded = []
+            self.save_btn.config(state=tk.NORMAL)
+            self.show_frame(image)
+
+        self.result_text.delete("1.0", tk.END)
+        self.result_text.insert(tk.END, f"已生成二维码：\n{path}\n\n")
+        self.result_text.insert(tk.END, f"二维码内容：\n{url}\n")
+        self.set_status("网址二维码已生成")
+        messagebox.showinfo("生成成功", f"二维码已保存到：\n{path}")
 
     def save_current(self):
         if self.current_result is None:

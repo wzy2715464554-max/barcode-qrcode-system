@@ -21,6 +21,13 @@ OUTPUT_DIR = ROOT / "outputs"
 OPENED_URLS = set()
 
 
+class DecodedItem:
+    def __init__(self, fmt, text, points):
+        self.format = fmt
+        self.text = text
+        self.points = np.array(points, dtype=np.int32)
+
+
 def normalize_url(text):
     value = (text or "").strip()
     if value.startswith(("http://", "https://")):
@@ -123,13 +130,62 @@ def locate_qr_finder_patterns(frame):
     return boxes
 
 
-def decode_barcodes(frame):
-    """Decode QR codes and common barcodes with ZXing-C++."""
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    return zxingcpp.read_barcodes(rgb)
+def decode_image(image):
+    # zxing-cpp accepts OpenCV's native BGR arrays or grayscale arrays directly.
+    return zxingcpp.read_barcodes(image, try_rotate=True, try_downscale=True, try_invert=True)
+
+
+def enhance_for_decode(image):
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
+    equalized = cv2.equalizeHist(gray)
+    binary = cv2.adaptiveThreshold(
+        equalized, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 7
+    )
+    inverted = cv2.bitwise_not(binary)
+    return [image, equalized, binary, inverted]
+
+
+def add_decoded_item(items, seen, raw_item, fallback_points=None):
+    text = (raw_item.text or "").strip()
+    fmt = str(raw_item.format)
+    key = (fmt, text)
+    if not text or key in seen:
+        return
+
+    seen.add(key)
+    if fallback_points is None:
+        items.append(raw_item)
+    else:
+        items.append(DecodedItem(fmt, text, fallback_points))
+
+
+def decode_barcodes(frame, candidates=None):
+    """Decode QR codes and common barcodes, then retry on corrected candidate regions."""
+    decoded = []
+    seen = set()
+
+    for image in enhance_for_decode(frame):
+        for item in decode_image(image):
+            add_decoded_item(decoded, seen, item)
+
+    for box in candidates or []:
+        corrected = perspective_correct(frame, box)
+        if corrected.size == 0:
+            continue
+        corrected = cv2.copyMakeBorder(corrected, 18, 18, 18, 18, cv2.BORDER_CONSTANT, value=(255, 255, 255))
+        if min(corrected.shape[:2]) < 120:
+            corrected = cv2.resize(corrected, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+
+        for image in enhance_for_decode(corrected):
+            for item in decode_image(image):
+                add_decoded_item(decoded, seen, item, fallback_points=box)
+
+    return decoded
 
 
 def barcode_points(barcode):
+    if hasattr(barcode, "points"):
+        return barcode.points
     pos = barcode.position
     points = [
         (int(pos.top_left.x), int(pos.top_left.y)),
@@ -217,9 +273,9 @@ def run_image(path, show_window=True):
     if frame is None:
         raise SystemExit(f"无法读取图片：{path}")
 
-    decoded = decode_barcodes(frame)
-    open_urls(decoded)
     candidates = locate_barcode_candidates(frame)
+    decoded = decode_barcodes(frame, candidates)
+    open_urls(decoded)
     qr_patterns = locate_qr_finder_patterns(frame)
     result = draw_results(frame, decoded, candidates, qr_patterns)
 
@@ -251,9 +307,9 @@ def run_camera(camera_id):
             print("读取摄像头画面失败。")
             break
 
-        decoded = decode_barcodes(frame)
-        open_urls(decoded)
         candidates = locate_barcode_candidates(frame)
+        decoded = decode_barcodes(frame, candidates)
+        open_urls(decoded)
         qr_patterns = locate_qr_finder_patterns(frame)
         result = draw_results(frame, decoded, candidates, qr_patterns)
         last_result = result
@@ -289,11 +345,40 @@ def make_samples():
     print(f"已生成条形码：{barcode_path}.png")
 
 
+def make_qr_code(content, output_name=None):
+    DATA_DIR.mkdir(exist_ok=True)
+
+    import qrcode
+
+    if not output_name:
+        stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_name = f"custom_qrcode_{stamp}.png"
+    if not output_name.lower().endswith(".png"):
+        output_name += ".png"
+
+    path = DATA_DIR / output_name
+    qr = qrcode.QRCode(
+        version=None,
+        error_correction=qrcode.constants.ERROR_CORRECT_M,
+        box_size=10,
+        border=4,
+    )
+    qr.add_data(content)
+    qr.make(fit=True)
+    image = qr.make_image(fill_color="black", back_color="white")
+    image.save(path)
+    print(f"已生成二维码：{path}")
+    print(f"二维码内容：{content}")
+    return path
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="条形码与二维码实时定位与解码系统")
     parser.add_argument("image", nargs="?", help="待检测图片路径；不填则打开摄像头")
     parser.add_argument("--camera", type=int, default=0, help="摄像头编号，默认 0")
     parser.add_argument("--make-samples", action="store_true", help="生成二维码和条形码测试图片")
+    parser.add_argument("--make-qr", help="根据输入文字或网址生成二维码")
+    parser.add_argument("--qr-output", help="二维码输出文件名，默认保存到 data/ 文件夹")
     parser.add_argument("--no-window", action="store_true", help="只保存结果，不弹出显示窗口")
     return parser.parse_args()
 
@@ -302,6 +387,9 @@ def main():
     args = parse_args()
     if args.make_samples:
         make_samples()
+        return
+    if args.make_qr:
+        make_qr_code(args.make_qr, args.qr_output)
         return
     if args.image:
         run_image(Path(args.image), show_window=not args.no_window)
