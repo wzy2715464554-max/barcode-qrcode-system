@@ -22,6 +22,18 @@ OUTPUT_DIR = ROOT / "outputs"
 OPENED_URLS = set()
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 TEXT_PREVIEW_LIMIT = 220
+ALLOWED_FORMAT_KEYWORDS = (
+    "QR Code",
+    "Code 128",
+    "Code 39",
+    "Code 93",
+    "EAN-13",
+    "EAN-8",
+    "UPC-A",
+    "UPC-E",
+    "ITF",
+    "Codabar",
+)
 
 
 class DecodedItem:
@@ -160,6 +172,8 @@ def add_decoded_item(items, seen, raw_item, fallback_points=None):
     fmt = str(raw_item.format)
     key = (fmt, text)
     if not text or key in seen:
+        return
+    if not any(keyword.lower() in fmt.lower() for keyword in ALLOWED_FORMAT_KEYWORDS):
         return
 
     seen.add(key)
@@ -311,7 +325,7 @@ def save_preprocess_images(frame, prefix):
     return paths
 
 
-def analyze_frame(frame):
+def analyze_frame(frame, fast=False):
     candidates = locate_barcode_candidates(frame)
     decoded = decode_barcodes(frame, candidates)
     qr_patterns = locate_qr_finder_patterns(frame)

@@ -39,6 +39,7 @@ class BarcodeApp:
         self.current_photo = None
         self.opened_urls = set()
         self.last_text_path = None
+        self.show_debug_boxes = tk.BooleanVar(value=False)
 
         self.configure_style()
         self.build_ui()
@@ -133,14 +134,22 @@ class BarcodeApp:
         self.copy_btn = ttk.Button(parent, text="复制识别内容", command=self.copy_results, state=tk.DISABLED)
         self.copy_btn.pack(fill=tk.X, padx=16, pady=5)
 
+        self.debug_check = ttk.Checkbutton(
+            parent,
+            text="显示调试候选框",
+            variable=self.show_debug_boxes,
+            command=self.refresh_current_view,
+        )
+        self.debug_check.pack(anchor="w", padx=16, pady=(8, 4))
+
         ttk.Separator(parent).pack(fill=tk.X, padx=16, pady=14)
 
         legend = ttk.Frame(parent, style="Panel.TFrame")
         legend.pack(fill=tk.X, padx=16, pady=(0, 10))
         ttk.Label(legend, text="颜色说明", style="Panel.TLabel", font=("Microsoft YaHei UI", 11, "bold")).pack(anchor="w")
-        ttk.Label(legend, text="橙色：条形码候选区", style="Subtle.TLabel").pack(anchor="w", pady=(6, 0))
-        ttk.Label(legend, text="蓝色：二维码定位角", style="Subtle.TLabel").pack(anchor="w")
+        ttk.Label(legend, text="蓝色：二维码定位角", style="Subtle.TLabel").pack(anchor="w", pady=(6, 0))
         ttk.Label(legend, text="绿色：成功解码区域", style="Subtle.TLabel").pack(anchor="w")
+        ttk.Label(legend, text="橙色：条形码候选区（调试）", style="Subtle.TLabel").pack(anchor="w")
 
     def build_preview(self, parent):
         top = ttk.Frame(parent, style="Panel.TFrame")
@@ -149,15 +158,22 @@ class BarcodeApp:
         self.mode_label = ttk.Label(top, text="当前模式：待机", style="Subtle.TLabel")
         self.mode_label.pack(side=tk.RIGHT)
 
-        self.image_panel = tk.Label(
+        self.image_canvas = tk.Canvas(
             parent,
             bg=self.colors["canvas"],
-            fg="#cbd5e1",
-            text="请选择图片、打开摄像头，或运行批量测试",
-            font=("Microsoft YaHei UI", 15),
+            highlightthickness=0,
             relief=tk.FLAT,
         )
-        self.image_panel.pack(fill=tk.BOTH, expand=True, padx=18, pady=(0, 18))
+        self.image_canvas.pack(fill=tk.BOTH, expand=True, padx=18, pady=(0, 18))
+        self.image_canvas.create_text(
+            20,
+            20,
+            text="请选择图片、打开摄像头，或运行批量测试",
+            fill="#cbd5e1",
+            anchor="nw",
+            font=("Microsoft YaHei UI", 15),
+            tags="placeholder",
+        )
 
     def build_result_panel(self, parent):
         ttk.Label(parent, text="识别结果", style="Panel.TLabel", font=("Microsoft YaHei UI", 13, "bold")).pack(anchor="w", padx=16, pady=(18, 10))
@@ -223,20 +239,18 @@ class BarcodeApp:
             self.result_text.insert(tk.END, f"   内容：{shortened}{suffix}\n")
 
     def show_frame(self, frame):
-        panel_w = max(1, self.image_panel.winfo_width())
-        panel_h = max(1, self.image_panel.winfo_height())
+        panel_w = max(1, self.image_canvas.winfo_width())
+        panel_h = max(1, self.image_canvas.winfo_height())
 
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         image = Image.fromarray(rgb)
         image.thumbnail((panel_w, panel_h), Image.Resampling.LANCZOS)
-
-        canvas = Image.new("RGB", (panel_w, panel_h), self.colors["canvas"])
         x = (panel_w - image.width) // 2
         y = (panel_h - image.height) // 2
-        canvas.paste(image, (x, y))
 
-        self.current_photo = ImageTk.PhotoImage(canvas)
-        self.image_panel.config(image=self.current_photo, text="")
+        self.current_photo = ImageTk.PhotoImage(image)
+        self.image_canvas.delete("all")
+        self.image_canvas.create_image(x, y, image=self.current_photo, anchor="nw")
 
     def process_frame(self, frame, open_mode="camera"):
         analysis = core.analyze_frame(frame)
@@ -244,11 +258,30 @@ class BarcodeApp:
         self.open_urls(decoded, mode=open_mode)
         self.current_frame = frame.copy()
         self.current_decoded = decoded
-        self.current_result = analysis["result"]
+        candidates = analysis["candidates"] if self.show_debug_boxes.get() else None
+        self.current_result = core.draw_results(
+            frame,
+            decoded,
+            candidates,
+            analysis["qr_patterns"],
+        )
         self.save_btn.config(state=tk.NORMAL)
         self.preprocess_btn.config(state=tk.NORMAL)
         self.set_results(decoded)
-        return analysis["result"], decoded
+        return self.current_result, decoded
+
+    def refresh_current_view(self):
+        if self.current_frame is None:
+            return
+        analysis = core.analyze_frame(self.current_frame)
+        candidates = analysis["candidates"] if self.show_debug_boxes.get() else None
+        self.current_result = core.draw_results(
+            self.current_frame,
+            self.current_decoded,
+            candidates,
+            analysis["qr_patterns"],
+        )
+        self.show_frame(self.current_result)
 
     def normalize_url(self, text):
         value = (text or "").strip()
